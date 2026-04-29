@@ -2,7 +2,7 @@ import re
 import shlex
 import json
 from urllib.parse import parse_qsl, urlparse
-
+import os
 from curl import DEFAULT_CURL_INPUT
 
 # Regex for {{place}}, ${place}, <place>
@@ -341,6 +341,7 @@ def main():
     raw_input_list = DEFAULT_CURL_INPUT
     script_code, function_names = build_python_script(raw_input_list)
     parser_code = build_parser_py(function_names)
+    os.makedirs("generated_code", exist_ok=True)
     with open("generated_code/request_script.py", "w", encoding="utf-8") as f:
         f.write(script_code)
     with open("generated_code/parser.py", "w", encoding="utf-8") as f:
