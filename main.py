@@ -1,93 +1,184 @@
+from __future__ import annotations
+
+import json
 import re
 import shlex
-import json
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, urlparse
-import os
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
 from curl import DEFAULT_CURL_INPUT
 
-# Regex for {{place}}, ${place}, <place>
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+
 PLACEHOLDER_PATTERN = re.compile(
     r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}|"
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|"
     r"<([A-Za-z_][A-Za-z0-9_]*)>"
 )
 
-def curl_to_requests(curl_command):
+
+class ConvertPayload(BaseModel):
+    curl_text: str = Field(default="", description="One or more curl commands")
+
+
+def build_default_raw_text() -> str:
+    return "\n\n".join(entry["curl"].strip() for entry in DEFAULT_CURL_INPUT)
+
+
+def normalize_block(block: str) -> str:
+    lines = [line.rstrip() for line in block.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def split_curl_blocks(raw_text: str) -> list[str]:
+    if not raw_text:
+        return []
+
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, list):
+        blocks = []
+        for item in parsed:
+            if isinstance(item, dict):
+                curl_command = item.get("curl")
+                if isinstance(curl_command, str) and curl_command.strip():
+                    blocks.append(normalize_block(curl_command))
+        if blocks:
+            return blocks
+
+    blocks = []
+    current_lines: list[str] = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.rstrip()
+        starts_new_command = re.match(r"^\s*(?:\$\s*)?curl\b", line) is not None
+
+        if starts_new_command and current_lines:
+            block = normalize_block("\n".join(current_lines))
+            if block:
+                blocks.append(block)
+            current_lines = []
+
+        if line.strip() or current_lines:
+            current_lines.append(line)
+
+    if current_lines:
+        block = normalize_block("\n".join(current_lines))
+        if block:
+            blocks.append(block)
+
+    return blocks
+
+
+def curl_to_spec(curl_command: str) -> dict[str, Any]:
     tokens = shlex.split(curl_command)
     method = "GET"
     url = ""
-    params = {}
-    headers = {}
-    data = None
+    params: dict[str, str] = {}
+    headers: dict[str, str] = {}
+    data: str | None = None
     explicit_method = False
 
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+
         if token == "curl":
-            i += 1
+            index += 1
             continue
 
         if token in (
-            "--location", "-L",
-            "--compressed", "-s", "--silent",
-            "--show-error", "--fail", "--fail-with-body"
+            "--location",
+            "-L",
+            "--compressed",
+            "-s",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--fail-with-body",
         ):
-            i += 1
+            index += 1
             continue
 
-        if token in ("--request", "-X") and i + 1 < len(tokens):
-            method = tokens[i + 1].upper()
+        if token in ("--request", "-X") and index + 1 < len(tokens):
+            method = tokens[index + 1].upper()
             explicit_method = True
-            i += 2
+            index += 2
             continue
 
-        if token in ("--header", "-H") and i + 1 < len(tokens):
-            header = tokens[i + 1]
+        if token in ("--header", "-H") and index + 1 < len(tokens):
+            header = tokens[index + 1]
             if ":" in header:
                 key, value = header.split(":", 1)
                 headers[key.strip()] = value.strip()
-            i += 2
+            index += 2
             continue
 
-        if token in ("--cookie", "-b") and i + 1 < len(tokens):
-            cookie_value = tokens[i + 1]
+        if token in ("--cookie", "-b") and index + 1 < len(tokens):
+            cookie_value = tokens[index + 1]
             if "Cookie" in headers and headers["Cookie"]:
                 headers["Cookie"] += "; " + cookie_value
             else:
                 headers["Cookie"] = cookie_value
-            i += 2
+            index += 2
             continue
 
-        if token in ("--user-agent", "-A") and i + 1 < len(tokens):
-            headers["User-Agent"] = tokens[i + 1]
-            i += 2
+        if token in ("--user-agent", "-A") and index + 1 < len(tokens):
+            headers["User-Agent"] = tokens[index + 1]
+            index += 2
             continue
 
         if token in (
-            "--data", "--data-raw", "--data-binary",
-            "--data-ascii", "--data-urlencode", "-d"
-        ) and i + 1 < len(tokens):
-            data = tokens[i + 1]
+            "--data",
+            "--data-raw",
+            "--data-binary",
+            "--data-ascii",
+            "--data-urlencode",
+            "-d",
+        ) and index + 1 < len(tokens):
+            data = tokens[index + 1]
             if not explicit_method:
                 method = "POST"
-            i += 2
+            index += 2
             continue
 
         if token in ("--get", "-G"):
             method = "GET"
             explicit_method = True
-            i += 1
+            index += 1
             continue
 
         if token.startswith("http://") or token.startswith("https://"):
             parsed_url = urlparse(token)
             url = parsed_url._replace(query="", fragment="").geturl()
             params = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
-            i += 1
+            index += 1
             continue
 
-        i += 1
+        index += 1
+
+    if not url:
+        raise ValueError("No URL found in curl command")
 
     return {
         "method": method,
@@ -97,30 +188,29 @@ def curl_to_requests(curl_command):
         "data": data,
     }
 
-def find_placeholders(text):
+
+def find_placeholders(text: str | None) -> list[str]:
     if not text:
         return []
-    found = []
+
+    found: list[str] = []
     for match in PLACEHOLDER_PATTERN.finditer(text):
         name = next(group for group in match.groups() if group)
         if name not in found:
             found.append(name)
     return found
 
-def sanitize_identifier(text):
-    s = re.sub(r"[^a-zA-Z0-9_]+", "_", text.strip().lower())
-    s = re.sub(r"_+", "_", s).strip("_")
-    if not s:
-        s = "value"
-    if not re.match(r"[A-Za-z_]", s):
-        s = f"param_{s}"
-    return s
 
-def render_template_expression(text):
+def render_template_expression(text: str | None) -> str:
     if text is None:
         return "None"
-    pieces = []
+
+    if not find_placeholders(text):
+        return repr(text)
+
+    pieces: list[str] = []
     last = 0
+
     for match in PLACEHOLDER_PATTERN.finditer(text):
         literal = text[last:match.start()]
         if literal:
@@ -128,224 +218,169 @@ def render_template_expression(text):
         name = next(group for group in match.groups() if group)
         pieces.append(f"(str({name}) if {name} is not None else '')")
         last = match.end()
+
     tail = text[last:]
     if tail:
         pieces.append(repr(tail))
-    if not pieces:
-        return "''"
+
     if len(pieces) == 1:
         return pieces[0]
     return " + ".join(pieces)
 
-def build_request_arguments(spec):
-    arguments = []
-    used_names = set()
-    query_entries = []
-    payload_entries = []
-    payload_mode = None
-    payload_literal = None
 
-    def add_optional(name, default):
-        candidate = sanitize_identifier(name)
-        if candidate in used_names:
-            return candidate
-        used_names.add(candidate)
-        arguments.append({
-            "name": candidate,
-            "default": default,
-            "required": False,
-        })
-        return candidate
+def render_value_expression(value: Any) -> str:
+    if isinstance(value, str):
+        return render_template_expression(value)
+    return repr(value)
 
-    # Placeholders in URL
-    for ph in find_placeholders(spec["url"]):
-        add_optional(ph, None)
 
-    # Placeholders in query params
-    for key, value in spec["params"].items():
-        phs = find_placeholders(value)
-        if phs:
-            for ph in phs:
-                add_optional(ph, None)
-            query_entries.append({
-                "key": key,
-                "expression": render_template_expression(value),
-            })
-        else:
-            arg_name = add_optional(key, value)
-            query_entries.append({
-                "key": key,
-                "expression": arg_name,
-            })
+def parse_json_body(data: str | None) -> dict[str, Any] | None:
+    if not data:
+        return None
 
-    # Headers
-    for val in spec["headers"].values():
-        for ph in find_placeholders(val):
-            add_optional(ph, None)
+    try:
+        parsed_body = json.loads(data.strip())
+    except Exception:
+        return None
 
-    # Body/payload
-    if spec["data"]:
-        body_text = spec["data"].strip()
-        try:
-            parsed_body = json.loads(body_text)
-        except Exception:
-            parsed_body = None
+    return parsed_body if isinstance(parsed_body, dict) else None
 
-        if isinstance(parsed_body, dict):
-            payload_mode = "json"
-            for key, value in parsed_body.items():
-                if isinstance(value, str):
-                    phs = find_placeholders(value)
-                    if phs:
-                        for ph in phs:
-                            add_optional(ph, None)
-                        payload_entries.append({
-                            "key": key,
-                            "expression": render_template_expression(value),
-                        })
-                    else:
-                        arg_name = add_optional(key, value)
-                        payload_entries.append({
-                            "key": key,
-                            "expression": arg_name,
-                        })
-                else:
-                    arg_name = add_optional(key, value)
-                    payload_entries.append({
-                        "key": key,
-                        "expression": arg_name,
-                    })
-        else:
-            payload_mode = "raw"
-            payload_literal = render_template_expression(spec["data"])
-            for ph in find_placeholders(spec["data"]):
-                add_optional(ph, None)
 
-    return arguments, query_entries, payload_entries, payload_mode, payload_literal
+def determine_body_type(spec: dict[str, Any]) -> str:
+    parsed_body = parse_json_body(spec.get("data"))
+    if parsed_body is not None:
+        return "JSON"
+    if spec.get("data"):
+        return "RAW"
+    return "NONE"
 
-def render_request_function(spec):
-    args = []
-    for arg in spec["arguments"]:
-        if arg["required"]:
-            args.append(arg["name"])
-        else:
-            args.append(f"{arg['name']}={arg['default']!r}")
-    signature = f"def {spec['name']}({', '.join(args)}):" if args else f"def {spec['name']}():"
 
-    lines = [signature]
-    lines.append(f"    url = {render_template_expression(spec['url'])}")
+def collect_placeholders(spec: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    values = [spec.get("url"), *spec.get("params", {}).values(), *spec.get("headers", {}).values(), spec.get("data")]
+    for value in values:
+        for name in find_placeholders(value):
+            if name not in names:
+                names.append(name)
+    return names
 
-    # Query params
-    if spec["query_entries"]:
-        lines.append("    params = {")
-        for e in spec["query_entries"]:
-            lines.append(f"        {e['key']!r}: {e['expression']},")
-        lines.append("    }")
-    else:
-        lines.append("    params = None")
 
-    # Headers
-    lines.append("    headers = {")
-    for k, v in spec["headers"].items():
-        lines.append(f"        {k!r}: {render_template_expression(v)},")
-    lines.append("    }")
+def render_python_script(spec: dict[str, Any]) -> str:
+    body_type = determine_body_type(spec)
+    parsed_body = parse_json_body(spec.get("data"))
+    placeholders = collect_placeholders(spec)
 
-    # Payload
-    if spec["payload_mode"] == "json":
-        lines.append("    payload = {")
-        for e in spec["payload_entries"]:
-            lines.append(f"        {e['key']!r}: {e['expression']},")
-        lines.append("    }")
-    elif spec["payload_mode"] == "raw" and spec["payload_literal"] is not None:
-        lines.append(f"    payload = {spec['payload_literal']}")
-    else:
-        lines.append(f"    payload = {render_template_expression(spec['data'])}")
-
-    request_keyword = "json" if spec["payload_mode"] == "json" else "data"
+    lines: list[str] = ["import requests"]
+    if body_type == "JSON":
+        lines.append("import json")
 
     lines.append("")
-    lines.append(f"    response = requests.request(method={spec['method']!r}, url=url, params=params, headers=headers, {request_keyword}=payload, impersonate='chrome')")
-    lines.append(f"    response.raise_for_status()")
-    lines.append(f"    print(response)")
-    lines.append(f"    return {spec['name']}_parser(response)")
+
+    if placeholders:
+        for name in placeholders:
+            lines.append(f"{name} = None")
+        lines.append("")
+
+    lines.append(f"url = {render_template_expression(spec['url'])}")
+
+    params = spec.get("params") or {}
+    if params:
+        lines.append("params = {")
+        for key, value in params.items():
+            lines.append(f"    {key!r}: {render_value_expression(value)},")
+        lines.append("}")
+
+    headers = spec.get("headers") or {}
+    if headers:
+        lines.append("headers = {")
+        for key, value in headers.items():
+            lines.append(f"    {key!r}: {render_value_expression(value)},")
+        lines.append("}")
+
+    if body_type == "JSON" and parsed_body is not None:
+        lines.append("payload = json.dumps({")
+        for key, value in parsed_body.items():
+            lines.append(f"    {key!r}: {render_value_expression(value)},")
+        lines.append("})")
+    elif body_type == "RAW" and spec.get("data") is not None:
+        lines.append(f"payload = {render_template_expression(spec['data'])}")
+
+    lines.append("")
+
+    request_kwargs = [f"method={spec['method']!r}", "url=url"]
+    if params:
+        request_kwargs.append("params=params")
+    if headers:
+        request_kwargs.append("headers=headers")
+    if body_type != "NONE":
+        request_kwargs.append("data=payload")
+
+    lines.append(f"response = requests.request({', '.join(request_kwargs)})")
+    lines.append("print(response.text)")
     return "\n".join(lines)
 
-def render_main_function(request_specs):
-    lines = ["def do_requests():\n"]
-    for idx, spec in enumerate(request_specs):
-        lines.append(f"    response_{idx+1} = {spec['name']}()")
-    return "\n".join(lines)
-def build_request_specs_list(raw_input_list):
-    """Handles empty or duplicate names by autogenerating unique function names."""
-    specs = []
-    used_names = set()
-    for entry in raw_input_list:
-        curl_command = entry['curl']
-        supplied_name = entry.get('name', '').strip()
-        spec = curl_to_requests(curl_command)
 
-        # If name is missing/empty, generate one from url path
-        if supplied_name:
-            sanitized_fn = sanitize_identifier(supplied_name)
-        else:
-            # build name from url path (e.g., get_layout_search_post)
-            method = spec.get('method', 'get')
-            path = urlparse(spec.get('url', '')).path.strip("/").replace("/", "_")
-            sanitized_fn = sanitize_identifier(f"{method.lower()}_{path}" if path else method.lower())
+def build_request_preview(curl_command: str, index: int) -> dict[str, Any]:
+    spec = curl_to_spec(curl_command)
+    parsed_url = urlparse(spec["url"])
+    host = parsed_url.netloc or parsed_url.path or "unknown"
+    body_type = determine_body_type(spec)
+    filename = f"req_{index}.py"
 
-        # Ensure uniqueness
-        original_fn = sanitized_fn
-        suffix = 2
-        while sanitized_fn in used_names or not sanitized_fn:
-            sanitized_fn = f"{original_fn}_{suffix}"
-            suffix += 1
-        used_names.add(sanitized_fn)
+    return {
+        "id": index,
+        "title": f"Request {index}",
+        "filename": filename,
+        "method": spec["method"],
+        "host": host,
+        "bodyType": body_type,
+        "summary": f"{spec['method']} | {host} | {body_type}",
+        "curl": curl_command,
+        "code": render_python_script(spec),
+    }
 
-        spec["name"] = sanitized_fn
-        args, queries, payloads, pmode, plit = build_request_arguments(spec)
-        spec.update({
-            "arguments": args,
-            "query_entries": queries,
-            "payload_entries": payloads,
-            "payload_mode": pmode,
-            "payload_literal": plit,
-        })
-        specs.append(spec)
-    return specs
 
-def build_python_script(raw_input_list):
-    specs = build_request_specs_list(raw_input_list)
-    code = [
-        "from curl_cffi import requests",
-        "from parser import *",
-        ""
-    ]
-    for spec in specs:
-        code.append(render_request_function(spec))
-        code.append("")
-    code.append(render_main_function(specs))
-    code.append("")
-    code.append("if __name__ == '__main__':")
-    code.append("    do_requests()")
-    code.append("")
-    return "\n".join(code), [spec['name'] for spec in specs]
+def convert_raw_text(raw_text: str) -> dict[str, Any]:
+    blocks = split_curl_blocks(raw_text)
+    requests = []
 
-def build_parser_py(function_names):
-    code = []
-    for fn in function_names:
-        code.append(f"def {fn}_parser(response):")
-        code.append(f"    pass\n")
-    return "\n".join(code)
+    for index, block in enumerate(blocks, start=1):
+        try:
+            requests.append(build_request_preview(block, index))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Request {index}: {exc}") from exc
 
-def main():
-    raw_input_list = DEFAULT_CURL_INPUT
-    script_code, function_names = build_python_script(raw_input_list)
-    parser_code = build_parser_py(function_names)
-    os.makedirs("generated_code", exist_ok=True)
-    with open("generated_code/request_script.py", "w", encoding="utf-8") as f:
-        f.write(script_code)
-    with open("generated_code/parser.py", "w", encoding="utf-8") as f:
-        f.write(parser_code)
+    return {
+        "raw_text": raw_text,
+        "count": len(requests),
+        "requests": requests,
+    }
+
+
+DEFAULT_RAW_TEXT = build_default_raw_text()
+DEFAULT_RESPONSE = convert_raw_text(DEFAULT_RAW_TEXT)
+
+
+app = FastAPI(title="Curl Transpiller")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/default-input")
+def get_default_input() -> dict[str, Any]:
+    return DEFAULT_RESPONSE
+
+
+@app.post("/api/convert")
+def convert_curl(payload: ConvertPayload) -> dict[str, Any]:
+    return convert_raw_text(payload.curl_text)
+
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
