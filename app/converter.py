@@ -3,7 +3,6 @@ Curl to Python requests code converter
 Refactored from user-provided logic for FastAPI integration
 """
 import re
-import shlex
 import json
 from urllib.parse import parse_qsl, urlparse
 from typing import Dict, List, Optional, Any, Tuple,Union
@@ -16,9 +15,54 @@ PLACEHOLDER_PATTERN = re.compile(
 )
 
 
+def tokenize_curl_command(curl_command: str) -> List[str]:
+    """Split a curl command without failing on incomplete quotes."""
+    cleaned = re.sub(r"\\\r?\n", " ", curl_command)
+    tokens: List[str] = []
+    i = 0
+    length = len(cleaned)
+
+    while i < length:
+        if cleaned[i] in " \t\r\n":
+            i += 1
+            continue
+
+        token_parts: List[str] = []
+        while i < length and cleaned[i] not in " \t\r\n":
+            char = cleaned[i]
+
+            if char in ('"', "'"):
+                quote = char
+                i += 1
+                while i < length and cleaned[i] != quote:
+                    if cleaned[i] == "\\" and quote == '"' and i + 1 < length:
+                        token_parts.append(cleaned[i + 1])
+                        i += 2
+                    else:
+                        token_parts.append(cleaned[i])
+                        i += 1
+                if i < length and cleaned[i] == quote:
+                    i += 1
+                continue
+
+            if char == "\\" and i + 1 < length:
+                token_parts.append(cleaned[i + 1])
+                i += 2
+                continue
+
+            token_parts.append(char)
+            i += 1
+
+        token = "".join(token_parts).strip()
+        if token:
+            tokens.append(token)
+
+    return tokens
+
+
 def curl_to_requests(curl_command: str) -> Dict[str, Any]:
     """Parse curl command and extract request components"""
-    tokens = shlex.split(curl_command)
+    tokens = tokenize_curl_command(curl_command)
     method = "GET"
     url = ""
     params = {}
