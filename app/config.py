@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,
-        extra="ignore"   # 🔥 FIXES "Extra inputs are not permitted"
+        extra="ignore"   
     )
 
 
