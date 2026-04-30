@@ -20,7 +20,7 @@ from app.security import (
 )
 from app.models import (
     UserRegister, UserLogin, UserResponse, Token, TokenRefresh,
-    ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory,UserCreate
+    ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest
 )
 from app.converter import convert_curls
 
