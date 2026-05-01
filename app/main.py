@@ -53,6 +53,45 @@ def _find_request_function_name(request_code: str) -> Optional[str]:
     return None
 
 
+def _ensure_parser_functions(request_code: str, parser_code: str) -> str:
+    try:
+        request_tree = ast.parse(request_code)
+    except SyntaxError:
+        return parser_code
+
+    parser_names = set()
+    try:
+        parser_tree = ast.parse(parser_code or "")
+        parser_names = {
+            node.name
+            for node in parser_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+    except SyntaxError:
+        pass
+
+    required_names = set()
+    for node in ast.walk(request_tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.endswith("_parser"):
+            required_names.add(node.func.id)
+
+    missing_names = sorted(required_names - parser_names)
+    if not missing_names:
+        return parser_code
+
+    fallback_lines = [parser_code.rstrip(), ""]
+    for name in missing_names:
+        fallback_lines.extend([
+            f"def {name}(response):",
+            "    try:",
+            "        return response.json()",
+            "    except Exception:",
+            "        return getattr(response, 'text', str(response))",
+            "",
+        ])
+    return "\n".join(fallback_lines).lstrip()
+
+
 def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
     function_name = _find_request_function_name(payload.request_code)
     if not function_name:
@@ -138,7 +177,8 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
 
         tmp_path = Path(tmpdir)
         (tmp_path / "request.py").write_text(payload.request_code, encoding="utf-8")
-        (tmp_path / "parser.py").write_text(payload.parser_code, encoding="utf-8")
+        parser_code = _ensure_parser_functions(payload.request_code, payload.parser_code)
+        (tmp_path / "parser.py").write_text(parser_code, encoding="utf-8")
         (tmp_path / "_runner.py").write_text(runner_code, encoding="utf-8")
         result_path = tmp_path / "_result.json"
 
