@@ -1,4 +1,11 @@
 import logging
+import ast
+import json
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.responses import JSONResponse
@@ -20,12 +27,151 @@ from app.security import (
 )
 from app.models import (
     UserRegister, UserLogin, UserResponse, Token, TokenRefresh,
-    ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest
+    ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest,
+    RunWorkspaceRequest, RunWorkspaceResponse
 )
 from app.converter import convert_curls
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def _format_response_size(byte_count: int) -> str:
+    if byte_count < 1024:
+        return f"{byte_count} B"
+    return f"{byte_count / 1024:.1f} KB"
+
+
+def _find_request_function_name(request_code: str) -> Optional[str]:
+    try:
+        tree = ast.parse(request_code)
+    except SyntaxError:
+        return None
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name != "do_requests":
+            return node.name
+    return None
+
+
+def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
+    function_name = _find_request_function_name(payload.request_code)
+    if not function_name:
+        return RunWorkspaceResponse(
+            success=False,
+            workspace_name=payload.workspace_name,
+            logs="No runnable request function found in request.py",
+            error="Execution failed",
+        )
+
+    runner_code = textwrap.dedent(
+        """
+        import importlib.util
+        import json
+        import pathlib
+        import sys
+        import traceback
+
+        function_name = sys.argv[1]
+        output_path = pathlib.Path(sys.argv[2])
+        request_meta = {"status": None, "size": 0}
+
+        try:
+            from curl_cffi import requests as curl_requests
+            original_request = curl_requests.request
+
+            def tracked_request(*args, **kwargs):
+                response = original_request(*args, **kwargs)
+                request_meta["status"] = getattr(response, "status_code", None)
+                content = getattr(response, "content", None)
+                if content is not None:
+                    request_meta["size"] = len(content)
+                else:
+                    request_meta["size"] = len(getattr(response, "text", "") or "")
+                return response
+
+            curl_requests.request = tracked_request
+        except Exception:
+            pass
+
+        def normalize(value):
+            if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+                return value
+            if hasattr(value, "json"):
+                try:
+                    return value.json()
+                except Exception:
+                    pass
+            if hasattr(value, "text"):
+                return value.text
+            return str(value)
+
+        try:
+            spec = importlib.util.spec_from_file_location("workspace_request", "request.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            result = getattr(module, function_name)()
+            output_path.write_text(json.dumps({
+                "success": True,
+                "status": request_meta["status"],
+                "size_bytes": request_meta["size"],
+                "response": normalize(result),
+                "parsed": None,
+                "logs": "Request completed successfully",
+            }, default=str), encoding="utf-8")
+        except Exception as exc:
+            output_path.write_text(json.dumps({
+                "success": False,
+                "status": request_meta["status"],
+                "size_bytes": request_meta["size"],
+                "response": None,
+                "parsed": None,
+                "logs": traceback.format_exc(),
+                "error": str(exc) or "Execution failed",
+            }), encoding="utf-8")
+            raise
+        """
+    )
+
+    start = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="curl2py-run-") as tmpdir:
+        from pathlib import Path
+
+        tmp_path = Path(tmpdir)
+        (tmp_path / "request.py").write_text(payload.request_code, encoding="utf-8")
+        (tmp_path / "parser.py").write_text(payload.parser_code, encoding="utf-8")
+        (tmp_path / "_runner.py").write_text(runner_code, encoding="utf-8")
+        result_path = tmp_path / "_result.json"
+
+        completed = subprocess.run(
+            [sys.executable, "_runner.py", function_name, str(result_path)],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        time_ms = int((time.perf_counter() - start) * 1000)
+        output = {}
+        if result_path.exists():
+            output = json.loads(result_path.read_text(encoding="utf-8"))
+
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        run_logs = "\n".join(part for part in [output.get("logs"), stdout, stderr] if part)
+        size_bytes = int(output.get("size_bytes") or 0)
+        success = bool(output.get("success")) and completed.returncode == 0
+
+        return RunWorkspaceResponse(
+            success=success,
+            workspace_name=payload.workspace_name,
+            status=output.get("status"),
+            time_ms=time_ms,
+            size=_format_response_size(size_bytes),
+            response=output.get("response"),
+            parsed=output.get("parsed"),
+            logs=run_logs or ("Request completed successfully" if success else "Execution failed"),
+            error=None if success else output.get("error") or "Execution failed",
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -244,6 +390,37 @@ async def convert(
     except Exception as e:
         logger.error(f"Conversion error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+@app.post("/run-workspace", response_model=RunWorkspaceResponse, tags=["Execution"])
+async def run_workspace(run_req: RunWorkspaceRequest):
+    """Execute a single active workspace request through the backend."""
+    try:
+        return _run_workspace_code(run_req)
+    except subprocess.TimeoutExpired:
+        return RunWorkspaceResponse(
+            success=False,
+            workspace_name=run_req.workspace_name,
+            status=None,
+            time_ms=30000,
+            size="0 KB",
+            response=None,
+            parsed=None,
+            logs="Execution timed out after 30 seconds",
+            error="Execution failed",
+        )
+    except Exception as e:
+        logger.error(f"Workspace execution error: {e}", exc_info=True)
+        return RunWorkspaceResponse(
+            success=False,
+            workspace_name=run_req.workspace_name,
+            status=None,
+            time_ms=0,
+            size="0 KB",
+            response=None,
+            parsed=None,
+            logs=str(e),
+            error="Execution failed",
+        )
 
 # ============ HISTORY ENDPOINTS ============
 @app.get("/api/v1/history", response_model=List[ConversionHistory], tags=["History"])

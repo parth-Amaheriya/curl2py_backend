@@ -127,6 +127,22 @@ class ConversionResponse(BaseModel):
     error_type: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
+class RunWorkspaceRequest(BaseModel):
+    workspace_name: str
+    request_code: str
+    parser_code: str
+
+class RunWorkspaceResponse(BaseModel):
+    success: bool
+    workspace_name: str
+    status: Optional[int] = None
+    time_ms: int = 0
+    size: str = "0 KB"
+    response: Optional[Any] = None
+    parsed: Optional[Any] = None
+    logs: str = ""
+    error: Optional[str] = None
+
 class HealthResponse(BaseModel):
     status: str
     version: str
