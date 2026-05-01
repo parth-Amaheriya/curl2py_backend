@@ -128,6 +128,7 @@ class ConversionResponse(BaseModel):
     meta: Optional[Dict[str, Any]] = None
 
 class RunWorkspaceRequest(BaseModel):
+    collection_name: Optional[str] = None
     workspace_name: str
     request_code: str
     parser_code: str
