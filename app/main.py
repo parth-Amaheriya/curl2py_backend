@@ -41,6 +41,11 @@ def _format_response_size(byte_count: int) -> str:
     return f"{byte_count / 1024:.1f} KB"
 
 
+def _response_file_name(workspace_name: str, extension: str) -> str:
+    normalized = extension.lstrip(".")
+    return f"{workspace_name}_response.{normalized}"
+
+
 def _find_request_function_name(request_code: str) -> Optional[str]:
     try:
         tree = ast.parse(request_code)
@@ -83,10 +88,10 @@ def _ensure_parser_functions(request_code: str, parser_code: str) -> str:
     for name in missing_names:
         fallback_lines.extend([
             f"def {name}(response):",
-            "    try:",
+            "    content_type = response.headers.get('content-type', '')",
+            "    if 'application/json' in content_type.lower():",
             "        return response.json()",
-            "    except Exception:",
-            "        return getattr(response, 'text', str(response))",
+            "    return getattr(response, 'text', str(response))",
             "",
         ])
     return "\n".join(fallback_lines).lstrip()
@@ -98,6 +103,9 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
         return RunWorkspaceResponse(
             success=False,
             workspace_name=payload.workspace_name,
+            extension="json",
+            response_file_name=_response_file_name(payload.workspace_name, "json"),
+            file_name=_response_file_name(payload.workspace_name, "json"),
             logs="No runnable request function found in request.py",
             error="Execution failed",
         )
@@ -112,7 +120,13 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
 
         function_name = sys.argv[1]
         output_path = pathlib.Path(sys.argv[2])
-        request_meta = {"status": None, "size": 0}
+        request_meta = {
+            "status": None,
+            "size": 0,
+            "content_type": "",
+            "extension": "json",
+            "response": None,
+        }
 
         try:
             from curl_cffi import requests as curl_requests
@@ -121,11 +135,21 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
             def tracked_request(*args, **kwargs):
                 response = original_request(*args, **kwargs)
                 request_meta["status"] = getattr(response, "status_code", None)
+                content_type = getattr(response, "headers", {}).get("content-type", "") or ""
+                request_meta["content_type"] = content_type
+                request_meta["extension"] = "json" if "application/json" in content_type.lower() else "txt"
                 content = getattr(response, "content", None)
                 if content is not None:
                     request_meta["size"] = len(content)
                 else:
                     request_meta["size"] = len(getattr(response, "text", "") or "")
+                if request_meta["extension"] == "json":
+                    try:
+                        request_meta["response"] = response.json()
+                    except Exception:
+                        request_meta["response"] = getattr(response, "text", "")
+                else:
+                    request_meta["response"] = getattr(response, "text", "")
                 return response
 
             curl_requests.request = tracked_request
@@ -148,21 +172,45 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
             spec = importlib.util.spec_from_file_location("workspace_request", "request.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            for attr_name in dir(module):
+                if not attr_name.endswith("_parser"):
+                    continue
+                parser_fn = getattr(module, attr_name)
+                if not callable(parser_fn):
+                    continue
+
+                def safe_parser(response, _parser_fn=parser_fn):
+                    try:
+                        return _parser_fn(response)
+                    except Exception:
+                        content_type = response.headers.get("content-type", "")
+                        if "application/json" in content_type.lower():
+                            return response.json()
+                        return getattr(response, "text", str(response))
+
+                setattr(module, attr_name, safe_parser)
             result = getattr(module, function_name)()
+            status = request_meta["status"]
+            completed = status is None or int(status) == 200
             output_path.write_text(json.dumps({
-                "success": True,
+                "success": completed,
                 "status": request_meta["status"],
                 "size_bytes": request_meta["size"],
-                "response": normalize(result),
+                "content_type": request_meta["content_type"],
+                "extension": request_meta["extension"],
+                "response": request_meta["response"] if request_meta["response"] is not None else normalize(result),
                 "parsed": None,
-                "logs": "Request completed successfully",
+                "logs": "Request completed successfully" if completed else f"Request failed with status {status}",
+                "error": None if completed else "Execution failed",
             }, default=str), encoding="utf-8")
         except Exception as exc:
             output_path.write_text(json.dumps({
                 "success": False,
                 "status": request_meta["status"],
                 "size_bytes": request_meta["size"],
-                "response": None,
+                "content_type": request_meta["content_type"],
+                "extension": request_meta["extension"],
+                "response": request_meta["response"],
                 "parsed": None,
                 "logs": traceback.format_exc(),
                 "error": str(exc) or "Execution failed",
@@ -200,6 +248,8 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
         run_logs = "\n".join(part for part in [output.get("logs"), stdout, stderr] if part)
         size_bytes = int(output.get("size_bytes") or 0)
         success = bool(output.get("success")) and completed.returncode == 0
+        extension = (output.get("extension") or "json").lstrip(".")
+        response_file_name = _response_file_name(payload.workspace_name, extension)
 
         return RunWorkspaceResponse(
             success=success,
@@ -207,6 +257,10 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
             status=output.get("status"),
             time_ms=time_ms,
             size=_format_response_size(size_bytes),
+            content_type=output.get("content_type") or "",
+            extension=extension,
+            response_file_name=response_file_name,
+            file_name=response_file_name,
             response=output.get("response"),
             parsed=output.get("parsed"),
             logs=run_logs or ("Request completed successfully" if success else "Execution failed"),
@@ -443,6 +497,9 @@ async def run_workspace(run_req: RunWorkspaceRequest):
             status=None,
             time_ms=30000,
             size="0 KB",
+            extension="json",
+            response_file_name=_response_file_name(run_req.workspace_name, "json"),
+            file_name=_response_file_name(run_req.workspace_name, "json"),
             response=None,
             parsed=None,
             logs="Execution timed out after 30 seconds",
@@ -456,6 +513,9 @@ async def run_workspace(run_req: RunWorkspaceRequest):
             status=None,
             time_ms=0,
             size="0 KB",
+            extension="json",
+            response_file_name=_response_file_name(run_req.workspace_name, "json"),
+            file_name=_response_file_name(run_req.workspace_name, "json"),
             response=None,
             parsed=None,
             logs=str(e),

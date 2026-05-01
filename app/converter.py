@@ -330,7 +330,23 @@ def render_request_function(spec: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"    response = requests.request(method={spec['method']!r}, url=url, params=params, headers=headers, {request_keyword}=payload, impersonate='chrome')")
     lines.append(f"    response.raise_for_status()")
+    lines.append(f"")
     lines.append(f"    print(response)")
+    lines.append(f"")
+    lines.append(f"    content_type = response.headers.get('content-type', '').lower()")
+    lines.append(f"    response_folder = 'pagesaves'")
+    lines.append(f"    os.makedirs(response_folder, exist_ok=True)")
+    lines.append(f"")
+    lines.append(f"    if response.status_code == 200:")
+    lines.append(f"        if 'application/json' in content_type:")
+    lines.append(f"            response_file = os.path.join(response_folder, {spec['name'] + '_response.json'!r})")
+    lines.append(f"            with open(response_file, 'w', encoding='utf-8') as f:")
+    lines.append(f"                json.dump(response.json(), f, indent=2, ensure_ascii=False)")
+    lines.append(f"        else:")
+    lines.append(f"            response_file = os.path.join(response_folder, {spec['name'] + '_response.txt'!r})")
+    lines.append(f"            with open(response_file, 'w', encoding='utf-8') as f:")
+    lines.append(f"                f.write(response.text)")
+    lines.append(f"")
     lines.append(f"    return {spec['name']}_parser(response)")
     return "\n".join(lines)
 
@@ -338,8 +354,8 @@ def render_request_function(spec: Dict[str, Any]) -> str:
 def render_main_function(request_specs: List[Dict[str, Any]]) -> str:
     """Generate main execution function"""
     lines = ["def do_requests():\n"]
-    for idx, spec in enumerate(request_specs):
-        lines.append(f"    response_{idx+1} = {spec['name']}()")
+    for spec in request_specs:
+        lines.append(f"    {spec['name']}_response = {spec['name']}()")
     return "\n".join(lines)
 
 
@@ -405,6 +421,8 @@ def build_python_script(raw_input_list: List[Dict[str, str]]) -> Tuple[str, List
     """Build complete Python script from curl commands"""
     specs = build_request_specs_list(raw_input_list)
     code = [
+        "import json",
+        "import os",
         "from curl_cffi import requests",
         "from parser import *",
         ""
@@ -426,7 +444,10 @@ def build_parser_py(function_names: List[str]) -> str:
     for fn in function_names:
         code.append(f"def {fn}_parser(response):")
         code.append(f"    # TODO: Implement response parsing logic")
-        code.append(f"    return response.json()  # or custom parsing\n")
+        code.append(f"    content_type = response.headers.get('content-type', '')")
+        code.append(f"    if 'application/json' in content_type.lower():")
+        code.append(f"        return response.json()")
+        code.append(f"    return response.text\n")
     return "\n".join(code)
 
 def convert_single_curl(curl_command: str, function_name: Optional[str] = None) -> Dict[str, Any]:

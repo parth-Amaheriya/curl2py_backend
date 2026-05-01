@@ -139,6 +139,10 @@ class RunWorkspaceResponse(BaseModel):
     status: Optional[int] = None
     time_ms: int = 0
     size: str = "0 KB"
+    content_type: str = ""
+    extension: str = "json"
+    response_file_name: Optional[str] = None
+    file_name: Optional[str] = None
     response: Optional[Any] = None
     parsed: Optional[Any] = None
     logs: str = ""
